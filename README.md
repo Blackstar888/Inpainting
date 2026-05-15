@@ -1,20 +1,118 @@
-# Ancient Painting Inpainting
+# 古画图像修复项目
 
-This project implements a Stable Diffusion inpainting workflow for damaged
-ancient paintings:
+本项目实现一个基于 Stable Diffusion Inpainting 的古画修复系统。模型输入受损图片和二值 mask，输出修复后的图片；同时支持使用 LoRA 进行古画风格微调，也支持使用 `clean/damaged/mask` 成对数据继续微调修复模型。
 
-- damaged image + binary mask -> repaired image
-- optional LoRA style adapter for ancient-painting texture
-- paired inpainting fine-tuning with `clean/damaged/mask` data
-- second-stage refinement from generated repairs and clean references
-- Gradio app entrypoint for Hugging Face Spaces
+主要能力：
 
-The LoRA design follows the same engineering idea as the local HesClip project:
-freeze the pretrained backbone and train only small low-rank adapter weights.
-The actual diffusion training uses Diffusers + PEFT so the saved weights can be
-loaded with `pipe.load_lora_weights(...)`.
+- 输入 `damaged image + mask`，输出 `repaired image`
+- 可以直接调用 Hugging Face 上的 inpainting 大模型
+- 可以训练古画风格 LoRA
+- 可以使用成对数据训练修复 LoRA
+- 可以根据模型输出和原图构造二阶段 refine 数据
+- 可以部署为 Hugging Face Gradio Space，并通过 API 调用
 
-## Data Layout
+mask 约定：
+
+```text
+mask = 255 / 白色：需要修复的受损区域
+mask = 0 / 黑色：不需要修改的正常区域
+```
+
+## 项目结构
+
+```text
+Inpainting/
+  app.py
+  README.md
+  requirements.txt
+  .gitignore
+  src/
+    __init__.py
+    image_utils.py
+    pipeline.py
+    infer_sd_lora.py
+    make_damage.py
+    datasets.py
+    train_common.py
+    train_lora.py
+    train_inpaint_lora.py
+    build_refine_dataset.py
+    metrics.py
+    hesclip_lora.py
+  data/
+    lora_train/
+      images/
+      captions/
+    train/
+      clean/
+      damaged/
+      mask/
+    val/
+      clean/
+      damaged/
+      mask/
+  checkpoints/
+  outputs/
+```
+
+## 文件作用
+
+### 根目录文件
+
+| 文件 | 作用 |
+|---|---|
+| `README.md` | 项目说明文档，包含数据结构、文件作用、安装、训练、推理、评估和部署命令。 |
+| `requirements.txt` | 项目依赖列表，包括 `diffusers`、`transformers`、`peft`、`accelerate`、`gradio`、`torch` 等。 |
+| `app.py` | Hugging Face Space / Gradio 应用入口。用户上传受损图和 mask 后，调用修复 pipeline，输出修复图；同时暴露 `/restore` API。 |
+| `.gitignore` | 忽略缓存、模型权重、输出图、训练数据等大文件，但保留必要目录结构。 |
+
+### `src/` 代码文件
+
+| 文件 | 作用 |
+|---|---|
+| `src/pipeline.py` | 推理核心。封装 `StableDiffusionInpaintPipeline`，负责加载 Hugging Face inpainting 模型、加载 LoRA、处理 prompt、mask、seed，并输出修复图。主要类是 `AncientPaintingInpainter`。 |
+| `src/infer_sd_lora.py` | 命令行推理脚本。支持单张图片修复，也支持批量处理 `input_dir + mask_dir`。 |
+| `src/train_lora.py` | 古画风格 LoRA 训练脚本。使用 `data/lora_train/images` 和 `data/lora_train/captions`，让模型学习古画纹理、纸张质感、笔触风格。 |
+| `src/train_inpaint_lora.py` | 成对修复微调脚本。使用 `data/train/clean`、`data/train/damaged`、`data/train/mask`。默认训练 LoRA；传入 `--train_mode full_unet` 时，可以微调整个 UNet。 |
+| `src/train_common.py` | 训练公共工具。负责加载 SD inpainting 组件、添加 LoRA、保存 LoRA 权重、保存完整模型、tokenize caption、设置随机种子等。 |
+| `src/datasets.py` | PyTorch 数据集定义。`CaptionImageDataset` 用于古画风格 LoRA 训练；`PairedInpaintDataset` 用于 clean/damaged/mask 成对微调。 |
+| `src/image_utils.py` | 图像工具函数。负责加载 RGB 图、加载二值 mask、resize、裁剪、tensor 转换、根据 mask 合成最终结果、查找同名文件等。 |
+| `src/make_damage.py` | 自动构造训练数据。从 clean 图生成划痕、污渍、缺失区域，同时保存 damaged 图和 mask。 |
+| `src/metrics.py` | 评价脚本。对预测结果和 clean 原图计算 `PSNR`、`SSIM`；如果提供 mask，还会计算 masked PSNR。 |
+| `src/build_refine_dataset.py` | 二阶段微调用。把第一阶段模型输出的修复图作为新的 damaged/input，再和 clean 原图、mask 组成 refine 数据集。 |
+| `src/hesclip_lora.py` | 参考 HesClip 项目的 LoRA 低秩线性层实现，体现“冻结主模型，只训练 LoRA A/B 参数”的思想。实际 Diffusers 训练主要使用 PEFT/Diffusers 原生 LoRA 保存格式。 |
+| `src/__init__.py` | 让 `src` 成为 Python 包，支持 `python -m src.xxx` 方式运行脚本。 |
+
+### 数据和输出目录
+
+| 目录 | 作用 |
+|---|---|
+| `data/lora_train/images` | 用于训练古画风格 LoRA 的古画图片。 |
+| `data/lora_train/captions` | LoRA 训练图片对应的 caption，文件名需要和图片同名，例如 `0001.png` 对应 `0001.txt`。 |
+| `data/train/clean` | 训练集 clean 原图。 |
+| `data/train/damaged` | 训练集受损图。 |
+| `data/train/mask` | 训练集受损区域 mask。 |
+| `data/val/clean` | 验证集 clean 原图，用于计算 PSNR / SSIM。 |
+| `data/val/damaged` | 验证集受损图。 |
+| `data/val/mask` | 验证集 mask。 |
+| `checkpoints/` | 保存训练得到的 LoRA 权重或完整微调模型。 |
+| `outputs/` | 保存推理结果、评价指标、对比图等输出。 |
+
+## 安装依赖
+
+建议先根据自己的 CUDA 版本安装合适的 PyTorch，然后再安装其他依赖。
+
+```bash
+python -m venv .venv
+.venv/Scripts/activate
+pip install -r requirements.txt
+```
+
+如果只做 CPU 推理，也可以直接安装 `requirements.txt`，但 Stable Diffusion 在 CPU 上会非常慢。
+
+## 数据准备
+
+项目默认使用如下数据结构：
 
 ```text
 data/
@@ -31,30 +129,24 @@ data/
     mask/
 ```
 
-Mask convention: white pixels (`255`) are damaged regions to repair; black
-pixels (`0`) are preserved.
+每组成对修复数据需要同名：
 
-## Install
-
-```bash
-python -m venv .venv
-.venv/Scripts/activate
-pip install -r requirements.txt
+```text
+data/train/clean/0001.png
+data/train/damaged/0001.png
+data/train/mask/0001.png
 ```
 
-For GPU training, install the PyTorch build that matches your CUDA version
-before installing the rest of the requirements.
-
-## Generate Synthetic Damage
+如果只有 clean 图，可以用脚本自动合成 damaged 和 mask：
 
 ```bash
 python -m src.make_damage --clean_dir raw/train_clean --output_root data --split train --size 512
 python -m src.make_damage --clean_dir raw/val_clean --output_root data --split val --size 512
 ```
 
-## Inference
+## 推理
 
-Single image:
+### 单张图片修复
 
 ```bash
 python -m src.infer_sd_lora \
@@ -64,7 +156,9 @@ python -m src.infer_sd_lora \
   --lora_weights checkpoints/ancient_painting_lora
 ```
 
-Batch:
+如果暂时没有训练好的 LoRA，可以去掉 `--lora_weights`，脚本会直接使用 Hugging Face 上的基础 inpainting 模型。
+
+### 批量修复
 
 ```bash
 python -m src.infer_sd_lora \
@@ -74,14 +168,31 @@ python -m src.infer_sd_lora \
   --lora_weights checkpoints/ancient_painting_lora
 ```
 
-If you do not have LoRA weights yet, omit `--lora_weights` and the script will
-run the base Hugging Face inpainting model.
+默认 prompt 位于 `src/pipeline.py`：
 
-## Train Ancient-Painting LoRA
+```text
+ancient Chinese painting, restore damaged areas, preserve original style,
+natural texture, aged paper, traditional brush strokes
+```
 
-Put style images in `data/lora_train/images`. Optional captions go in
-`data/lora_train/captions` with matching stems, for example
-`images/0001.png` and `captions/0001.txt`.
+## 训练古画风格 LoRA
+
+该步骤只需要古画图片和 caption，不需要 damaged-clean 成对数据。
+
+准备数据：
+
+```text
+data/lora_train/images/0001.png
+data/lora_train/captions/0001.txt
+```
+
+caption 示例：
+
+```text
+ancient Chinese painting, traditional brush strokes, aged paper texture
+```
+
+训练命令：
 
 ```bash
 accelerate launch -m src.train_lora \
@@ -94,10 +205,19 @@ accelerate launch -m src.train_lora \
   --max_train_steps 1000
 ```
 
-## Paired Inpainting Fine-Tuning
+训练完成后，`checkpoints/ancient_painting_lora` 可以作为 `--lora_weights` 被推理脚本加载。
 
-This uses `data/train/clean`, `data/train/damaged`, and `data/train/mask`.
-Default mode trains a LoRA adapter:
+## 使用成对数据微调修复能力
+
+该步骤使用：
+
+```text
+data/train/clean
+data/train/damaged
+data/train/mask
+```
+
+默认训练 LoRA，只更新少量低秩参数：
 
 ```bash
 accelerate launch -m src.train_inpaint_lora \
@@ -110,7 +230,7 @@ accelerate launch -m src.train_inpaint_lora \
   --max_train_steps 1000
 ```
 
-To fine-tune the original UNet instead of LoRA, use:
+如果需要微调原模型 UNet，可以使用：
 
 ```bash
 accelerate launch -m src.train_inpaint_lora \
@@ -121,14 +241,19 @@ accelerate launch -m src.train_inpaint_lora \
   --max_train_steps 1000
 ```
 
-Full UNet fine-tuning is much heavier than LoRA and needs more VRAM.
+注意：`full_unet` 比 LoRA 更耗显存，也更容易过拟合。课程实验中通常优先使用 LoRA。
 
-## Refine From Model Outputs
+## 根据输出结果继续 refine
 
-After generating repairs into `outputs/sd_lora`, you can refine against clean
-references in either of two ways.
+如果已经用模型生成了一批修复结果，例如放在：
 
-Use generated repairs directly during paired training:
+```text
+outputs/sd_lora
+```
+
+可以用两种方式把这些结果用于继续微调。
+
+### 方式一：训练时混入模型输出
 
 ```bash
 accelerate launch -m src.train_inpaint_lora \
@@ -138,7 +263,9 @@ accelerate launch -m src.train_inpaint_lora \
   --output_dir checkpoints/refined_inpaint_lora
 ```
 
-Or materialize a refine dataset:
+含义：训练时有 50% 概率用 `outputs/sd_lora` 里的修复结果作为 conditioning image，再以 clean 原图为目标继续训练。
+
+### 方式二：显式构造 refine 数据集
 
 ```bash
 python -m src.build_refine_dataset \
@@ -152,7 +279,11 @@ accelerate launch -m src.train_inpaint_lora \
   --output_dir checkpoints/refined_from_outputs_lora
 ```
 
-## Metrics
+此时 `data/refine/damaged` 实际存放的是上一轮模型输出的修复图，`data/refine/clean` 仍然是原始 clean 图。
+
+## 评价指标
+
+在有 clean 参考图的验证集上，可以计算 PSNR 和 SSIM：
 
 ```bash
 python -m src.metrics \
@@ -162,9 +293,17 @@ python -m src.metrics \
   --output outputs/metrics.json
 ```
 
-## Hugging Face Space
+输出包括：
 
-Upload this repository to a Gradio Space. Set these Space variables as needed:
+- `psnr`：整张图的 PSNR
+- `ssim`：整张图的 SSIM
+- `masked_psnr`：只在 mask 区域计算的 PSNR
+
+如果测试图没有 clean 参考图，则不能严格计算 PSNR / SSIM，只能做视觉质量分析。
+
+## Hugging Face Space 部署
+
+将本仓库上传到 Hugging Face Gradio Space 后，可以设置环境变量：
 
 ```text
 MODEL_ID=runwayml/stable-diffusion-inpainting
@@ -173,7 +312,14 @@ MAX_SIZE=768
 TORCH_DTYPE=auto
 ```
 
-The Space exposes a `restore` API endpoint. Example client call:
+其中：
+
+- `MODEL_ID` 是基础 inpainting 模型
+- `LORA_WEIGHTS` 是 LoRA 权重路径，可以是本地路径，也可以是 Hugging Face repo
+- `MAX_SIZE` 控制输入图像最大边长，避免显存爆掉
+- `TORCH_DTYPE` 可设为 `auto`、`fp16`、`bf16`、`fp32`
+
+Space 会暴露 `/restore` API。客户端调用示例：
 
 ```python
 from gradio_client import Client, handle_file
@@ -193,3 +339,20 @@ result = client.predict(
 )
 print(result)
 ```
+
+## 推荐实验流程
+
+最小可运行流程：
+
+1. 准备 clean 图像。
+2. 运行 `src.make_damage` 生成 `damaged` 和 `mask`。
+3. 准备 `data/lora_train/images` 和 caption。
+4. 运行 `src.train_lora` 训练古画风格 LoRA。
+5. 运行 `src.infer_sd_lora` 修复验证集或测试图。
+6. 运行 `src.metrics` 在有 clean 参考的验证集上计算指标。
+7. 使用 `src.train_inpaint_lora` 进一步做 paired inpainting 微调。
+8. 可选：使用 `outputs/sd_lora` 和 clean 原图继续 refine。
+
+## 说明
+
+本项目没有从零训练 Stable Diffusion，而是在 Hugging Face 预训练 inpainting 模型的基础上进行 LoRA 适配和可选 UNet 微调。这样更符合课程项目的计算资源限制，也能体现完整的深度学习训练、推理和评估流程。
